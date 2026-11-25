@@ -1,0 +1,18 @@
+{
+  "extends": "./electron-builder.json",
+  "productName": "Bitwarden SSH Float",
+  "appId": "com.bitwarden.desktop.sshfloat",
+  "extraMetadata": {
+    "name": "bitwarden-ssh-float"
+  },
+  "afterPack": null,
+  "afterSign": null,
+  "mac": {
+    "identity": null,
+    "extendInfo": {
+      "LSEnvironment": {
+        "BITWARDEN_NO_UPDATER": "1"
+      }
+    }
+  }
+}

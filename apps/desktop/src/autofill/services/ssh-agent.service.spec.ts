@@ -115,6 +115,7 @@ describe("SshAgentService", () => {
       mockI18nService as any,
       mockDesktopSettingsService as any,
       mockAccountService as any,
+      { sshAgentBarkUrl$: of(""), sshAgentBarkWaitForMac$: of(false) } as any,
     );
 
     await service.init();
@@ -525,8 +526,8 @@ describe("SshAgentService – sign request authorization", () => {
   let authStatusSubject: BehaviorSubject<AuthenticationStatus>;
   let accountSubject: BehaviorSubject<{ id: UserId } | null>;
   let mockSignRequestResponse: jest.Mock;
-  let mockDialogOpen: jest.Mock;
   let mockFocusWindow: jest.Mock;
+  let mockShowSshApprovalWindow: jest.Mock;
   let mockShowToast: jest.Mock;
   let mockGetAllDecrypted: jest.Mock;
 
@@ -536,8 +537,8 @@ describe("SshAgentService – sign request authorization", () => {
     authStatusSubject = new BehaviorSubject<AuthenticationStatus>(AuthenticationStatus.Unlocked);
     accountSubject = new BehaviorSubject<{ id: UserId } | null>({ id: "user-1" as UserId });
     mockSignRequestResponse = jest.fn().mockResolvedValue(undefined);
-    mockDialogOpen = jest.fn().mockReturnValue({ closed: of(true) });
     mockFocusWindow = jest.fn();
+    mockShowSshApprovalWindow = jest.fn().mockResolvedValue(true);
     mockShowToast = jest.fn();
     mockGetAllDecrypted = jest
       .fn()
@@ -554,7 +555,10 @@ describe("SshAgentService – sign request authorization", () => {
           listRequestResponse: jest.fn().mockResolvedValue(undefined),
         },
       },
-      platform: { focusWindow: mockFocusWindow },
+      platform: {
+        focusWindow: mockFocusWindow,
+        showSshApprovalWindow: mockShowSshApprovalWindow,
+      },
     };
 
     service = new SshAgentService(
@@ -563,7 +567,7 @@ describe("SshAgentService – sign request authorization", () => {
         getAllDecrypted: mockGetAllDecrypted,
       } as any,
       { info: jest.fn(), error: jest.fn(), debug: jest.fn() } as any,
-      { open: mockDialogOpen } as any,
+      { open: jest.fn() } as any,
       {
         // Only feed the sign channel. Returning one subject for every channel also drove the
         // list-keys pipeline, which calls getAllDecrypted and made per-call mocks unreliable.
@@ -586,6 +590,7 @@ describe("SshAgentService – sign request authorization", () => {
         sshAgentPromptBehavior$: promptBehaviorSubject.asObservable(),
       } as any,
       { activeAccount$: accountSubject.asObservable() } as any,
+      { sshAgentBarkUrl$: of(""), sshAgentBarkWaitForMac$: of(false) } as any,
     );
 
     await service.init();
@@ -620,7 +625,7 @@ describe("SshAgentService – sign request authorization", () => {
       sendSignRequest();
       await flush();
 
-      expect(mockDialogOpen).not.toHaveBeenCalled();
+      expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
       expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
     });
 
@@ -628,7 +633,7 @@ describe("SshAgentService – sign request authorization", () => {
       sendSignRequest();
       await flush();
 
-      expect(mockDialogOpen).not.toHaveBeenCalled();
+      expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
       expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
     });
 
@@ -639,7 +644,7 @@ describe("SshAgentService – sign request authorization", () => {
       sendSignRequest();
       await flush();
 
-      expect(mockDialogOpen).not.toHaveBeenCalled();
+      expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
       expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
     });
 
@@ -654,6 +659,21 @@ describe("SshAgentService – sign request authorization", () => {
   // The agent awaits a response for every request it sends, so a failure that returns nothing
   // blocks the SSH client until the native approval timeout.
   describe("failures still answer the agent", () => {
+    it("refuses an expired request without showing an approval window", async () => {
+      signRequestSubject.next({
+        cipherId: CIPHER_ID,
+        requestId: REQUEST_ID,
+        expiresAt: Date.now() - 1,
+        processName: "test-app",
+        namespace: "",
+        isAgentForwarding: false,
+      });
+      await flush();
+
+      expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
+      expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
+    });
+
     it("when decrypting the vault fails, refuses instead of hanging", async () => {
       mockGetAllDecrypted.mockRejectedValue(new Error("decryption failed"));
 
@@ -666,9 +686,7 @@ describe("SshAgentService – sign request authorization", () => {
     });
 
     it("when the approval dialog throws, refuses instead of hanging", async () => {
-      mockDialogOpen.mockImplementation(() => {
-        throw new Error("dialog failed to open");
-      });
+      mockShowSshApprovalWindow.mockRejectedValue(new Error("window failed to open"));
 
       sendSignRequest();
       await flush();
@@ -707,7 +725,7 @@ describe("SshAgentService – sign request authorization", () => {
     authStatusSubject.next(AuthenticationStatus.Unlocked);
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     const callsAfterFirstUnlock = mockSignRequestResponse.mock.calls.length;
 
     // A later lock/unlock cycle, with no new sign request, must not revive the old one.
@@ -716,7 +734,7 @@ describe("SshAgentService – sign request authorization", () => {
     authStatusSubject.next(AuthenticationStatus.Unlocked);
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse.mock.calls.length).toBe(callsAfterFirstUnlock);
   });
 
@@ -725,25 +743,52 @@ describe("SshAgentService – sign request authorization", () => {
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
   it("Always: shows dialog and approves when user confirms", async () => {
-    mockDialogOpen.mockReturnValue({ closed: of(true) });
+    mockShowSshApprovalWindow.mockResolvedValue(true);
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
   it("Always: shows dialog and denies when user rejects", async () => {
-    mockDialogOpen.mockReturnValue({ closed: of(false) });
+    mockShowSshApprovalWindow.mockResolvedValue(false);
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
+    expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
+  });
+
+  it("refuses an approval delivered after the vault locks", async () => {
+    let answer!: (value: boolean) => void;
+    mockShowSshApprovalWindow.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    sendSignRequest();
+    await flush();
+    authStatusSubject.next(AuthenticationStatus.Locked);
+    answer(true);
+    await flush();
+    expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
+    expect(mockSignRequestResponse).not.toHaveBeenCalledWith(REQUEST_ID, true);
+  });
+
+  it("refuses when opening the approval window fails", async () => {
+    mockShowSshApprovalWindow.mockRejectedValue(new Error("window failed to open"));
+
+    sendSignRequest();
+    await flush();
+    await flush();
+
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, false);
   });
 
@@ -752,7 +797,7 @@ describe("SshAgentService – sign request authorization", () => {
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -760,13 +805,13 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest();
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -775,7 +820,7 @@ describe("SshAgentService – sign request authorization", () => {
     sendSignRequest(true, "SHA256:fp-server1");
     await flush();
 
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -783,14 +828,14 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest(true, "SHA256:fp-server1");
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Same host fingerprint — no new prompt
     sendSignRequest(true, "SHA256:fp-server1");
     await flush();
 
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -798,14 +843,14 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest(true, "SHA256:fp-server1");
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Different host fingerprint — prompts again
     sendSignRequest(true, "SHA256:fp-server2");
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -813,14 +858,14 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest(false, "SHA256:fp-container1");
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // A different destination host must not inherit the first host's approval.
     sendSignRequest(false, "SHA256:fp-container2");
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -828,13 +873,13 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest(false, "SHA256:fp-container1");
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     sendSignRequest(false, "SHA256:fp-container1");
     await flush();
 
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -842,14 +887,14 @@ describe("SshAgentService – sign request authorization", () => {
     promptBehaviorSubject.next(SshAgentPromptType.RememberUntilLock);
     sendSignRequest(false, "SHA256:fp-container1");
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Same fingerprint, but forwarding is a distinct trust boundary and must re-prompt.
     sendSignRequest(true, "SHA256:fp-container1");
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -859,14 +904,14 @@ describe("SshAgentService – sign request authorization", () => {
     // Local approval
     sendSignRequest(false);
     await flush();
-    mockDialogOpen.mockClear();
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Forwarded request for same cipher — must still prompt
     sendSignRequest(true, "SHA256:fp-server1");
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -879,15 +924,15 @@ describe("SshAgentService – sign request authorization", () => {
     // First forwarded request with no fingerprint — prompts
     sendSignRequest(true, undefined);
     await flush();
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
-    mockDialogOpen.mockClear();
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Second forwarded request with no fingerprint — cannot cache, must prompt again
     sendSignRequest(true, undefined);
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -897,8 +942,8 @@ describe("SshAgentService – sign request authorization", () => {
     // Approve under user-1
     sendSignRequest(false);
     await flush();
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
-    mockDialogOpen.mockClear();
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Switch account — should clear the cache
@@ -909,7 +954,7 @@ describe("SshAgentService – sign request authorization", () => {
     sendSignRequest(false);
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -924,13 +969,13 @@ describe("SshAgentService – sign request authorization", () => {
 
     expect(mockFocusWindow).toHaveBeenCalled();
     expect(mockShowToast).toHaveBeenCalledWith(expect.objectContaining({ variant: "info" }));
-    expect(mockDialogOpen).not.toHaveBeenCalled();
+    expect(mockShowSshApprovalWindow).not.toHaveBeenCalled();
     expect(mockSignRequestResponse).not.toHaveBeenCalled();
 
     authStatusSubject.next(AuthenticationStatus.Unlocked);
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 
@@ -940,8 +985,8 @@ describe("SshAgentService – sign request authorization", () => {
     // First request — approved and remembered
     sendSignRequest();
     await flush();
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
-    mockDialogOpen.mockClear();
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
+    mockShowSshApprovalWindow.mockClear();
     mockSignRequestResponse.mockClear();
 
     // Vault locks then unlocks
@@ -954,7 +999,7 @@ describe("SshAgentService – sign request authorization", () => {
     sendSignRequest();
     await flush();
 
-    expect(mockDialogOpen).toHaveBeenCalledTimes(1);
+    expect(mockShowSshApprovalWindow).toHaveBeenCalledTimes(1);
     expect(mockSignRequestResponse).toHaveBeenCalledWith(REQUEST_ID, true);
   });
 });
@@ -1021,6 +1066,7 @@ describe("SshAgentService – list keys request", () => {
         sshAgentPromptBehavior$: of(SshAgentPromptType.Always),
       } as any,
       { activeAccount$: accountSubject.asObservable() } as any,
+      { sshAgentBarkUrl$: of(""), sshAgentBarkWaitForMac$: of(false) } as any,
     );
 
     await service.init();
@@ -1173,6 +1219,7 @@ describe("SshAgentService – concurrent sign requests", () => {
         sshAgentPromptBehavior$: of(SshAgentPromptType.Never),
       } as any,
       { activeAccount$: of({ id: "user-1" as UserId }) } as any,
+      { sshAgentBarkUrl$: of(""), sshAgentBarkWaitForMac$: of(false) } as any,
     );
 
     await service.init();
@@ -1279,6 +1326,7 @@ describe("SshAgentService – concurrent list keys requests", () => {
         sshAgentPromptBehavior$: of(SshAgentPromptType.Always),
       } as any,
       { activeAccount$: of({ id: "user-1" as UserId }) } as any,
+      { sshAgentBarkUrl$: of(""), sshAgentBarkWaitForMac$: of(false) } as any,
     );
 
     await service.init();

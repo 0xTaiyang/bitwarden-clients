@@ -189,6 +189,8 @@ export class SettingsDialogComponent implements OnInit {
     { initialValue: true },
   );
   protected readonly refreshTimeoutSettings$ = new BehaviorSubject<void>(undefined);
+  protected testingBark = false;
+  protected barkTestResult = "";
 
   protected readonly form = this.formBuilder.group({
     // Security
@@ -207,6 +209,29 @@ export class SettingsDialogComponent implements OnInit {
     enableHardwareAcceleration: true,
     enableSshAgent: false,
     sshAgentPromptBehavior: SshAgentPromptType.Always,
+    sshAgentBarkWaitForMac: true,
+    sshAgentBarkUrl: this.formBuilder.nonNullable.control("", {
+      updateOn: "blur",
+      validators: (control) => {
+        const value = (control.value as string).trim();
+        if (!value) {
+          return null;
+        }
+        try {
+          const url = new URL(value);
+          return url.protocol === "https:" &&
+            !url.username &&
+            !url.password &&
+            !url.hash &&
+            url.pathname !== "/" &&
+            !/\s/.test(value)
+            ? null
+            : { barkUrl: true };
+        } catch {
+          return { barkUrl: true };
+        }
+      },
+    }),
     allowScreenshots: false,
     enableDuckDuckGoBrowserIntegration: false,
     enableAutotype: this.formBuilder.control<boolean>({
@@ -322,6 +347,10 @@ export class SettingsDialogComponent implements OnInit {
       sshAgentPromptBehavior: await firstValueFrom(
         this.desktopSettingsService.sshAgentPromptBehavior$,
       ),
+      sshAgentBarkUrl: await firstValueFrom(this.desktopAutofillSettingsService.sshAgentBarkUrl$),
+      sshAgentBarkWaitForMac: await firstValueFrom(
+        this.desktopAutofillSettingsService.sshAgentBarkWaitForMac$,
+      ),
       allowScreenshots: !(await firstValueFrom(this.desktopSettingsService.preventScreenshots$)),
       enableAutotype: await firstValueFrom(
         this.desktopAutotypeMvpService.autotypeEnabledUserSetting$,
@@ -392,6 +421,26 @@ export class SettingsDialogComponent implements OnInit {
     this.form.controls.sshAgentPromptBehavior.valueChanges
       .pipe(
         concatMap(async (value: SshAgentPromptType) => this.saveSshAgentPromptBehavior(value)),
+        takeUntilDestroyed(this.destroyRef),
+      )
+      .subscribe();
+
+    this.form.controls.sshAgentBarkUrl.valueChanges
+      .pipe(
+        concatMap(async (value) => {
+          if (this.form.controls.sshAgentBarkUrl.valid) {
+            await this.desktopAutofillSettingsService.setSshAgentBarkUrl(value);
+          }
+        }),
+        takeUntilDestroyed(this.destroyRef),
+      )
+      .subscribe();
+
+    this.form.controls.sshAgentBarkWaitForMac.valueChanges
+      .pipe(
+        concatMap(async (value) =>
+          this.desktopAutofillSettingsService.setSshAgentBarkWaitForMac(value),
+        ),
         takeUntilDestroyed(this.destroyRef),
       )
       .subscribe();
@@ -725,6 +774,26 @@ export class SettingsDialogComponent implements OnInit {
 
   protected async saveSshAgent() {
     await this.desktopSettingsService.setSshAgentEnabled(this.form.value.enableSshAgent);
+  }
+
+  protected async testBarkNotification() {
+    const control = this.form.controls.sshAgentBarkUrl;
+    if (control.invalid || !control.value.trim() || this.testingBark) {
+      return;
+    }
+    this.testingBark = true;
+    this.barkTestResult = "";
+    try {
+      await this.desktopAutofillSettingsService.setSshAgentBarkUrl(control.value);
+      const sent = await ipc.platform.testSshBarkNotification(control.value);
+      this.barkTestResult = this.i18nService.t(
+        sent ? "sshAgentBarkTestSent" : "sshAgentBarkTestFailed",
+      );
+    } catch {
+      this.barkTestResult = this.i18nService.t("sshAgentBarkTestFailed");
+    } finally {
+      this.testingBark = false;
+    }
   }
 
   private async saveSshAgentPromptBehavior(newValue: SshAgentPromptType) {

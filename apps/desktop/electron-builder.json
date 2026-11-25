@@ -6,6 +6,7 @@
   "productName": "Bitwarden",
   "appId": "com.bitwarden.desktop",
   "buildDependenciesFromSource": true,
+  "asarUnpack": ["ssh-glass.node"],
   "copyright": "Copyright © 2015-2026 Bitwarden Inc.",
   "directories": {
     "buildResources": "resources",

@@ -6,7 +6,17 @@ import { pathToFileURL } from "node:url";
 import * as path from "path";
 import * as url from "url";
 
-import { app, BrowserWindow, ipcMain, nativeTheme, screen, session, protocol, net } from "electron";
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  screen,
+  session,
+  protocol,
+  net,
+  powerMonitor,
+} from "electron";
 import { concatMap, firstValueFrom, pairwise } from "rxjs";
 
 import { LogService } from "@bitwarden/common/platform/abstractions/log.service";
@@ -16,6 +26,9 @@ import { UrlType } from "@bitwarden/common/platform/misc/safe-urls";
 import { processisolations } from "@bitwarden/desktop-napi";
 import { BiometricStateService } from "@bitwarden/key-management";
 
+import { applySshApprovalGlass } from "../autofill/main/ssh-approval-glass";
+import { SshRemoteApprovalService } from "../autofill/main/ssh-remote-approval.service";
+import { SshApprovalPrompt } from "../autofill/models/ssh-approval-prompt";
 import { SafeShell } from "../platform/main/safe-shell.main";
 import { WindowState } from "../platform/models/domain/window-state";
 import { applyMainWindowStyles, applyPopupModalStyles } from "../platform/popup-modal-styles";
@@ -49,6 +62,13 @@ protocol.registerSchemesAsPrivileged([
 
 const mainWindowSizeKey = "mainWindowSize";
 const WindowEventHandlingDelay = 100;
+const sshApprovalWindowWidth = 440;
+
+interface PendingSshApproval {
+  request: SshApprovalPrompt;
+  window: BrowserWindow;
+  finish: (approved: boolean, closeWindow?: boolean) => void;
+}
 
 /**
  * Every path prefix a Bitwarden snap's real binary can sit under — one per snap name per snapd
@@ -114,6 +134,10 @@ export class WindowMain {
   private windowStates: { [key: string]: WindowState } = {};
   private enableAlwaysOnTop = false;
   private enableRendererProcessForceCrashReload = true;
+  private pendingSshApprovals = new Map<number, PendingSshApproval>();
+  private readonly remoteSshApproval = new SshRemoteApprovalService();
+  private sshApprovalsSuspended = false;
+  private sshApprovalsResumeAfter = 0;
   session: Electron.Session;
 
   readonly defaultWidth = 950;
@@ -128,12 +152,44 @@ export class WindowMain {
     private argvCallback: (argv: string[]) => void = null,
     private createWindowCallback: (win: BrowserWindow) => void,
     private focusWindowCallback: () => Promise<void> | void = null,
-  ) {}
+  ) {
+    powerMonitor.on("suspend", () => {
+      this.sshApprovalsSuspended = true;
+      this.denySshApprovals();
+    });
+    powerMonitor.on("resume", () => {
+      this.sshApprovalsSuspended = false;
+      this.sshApprovalsResumeAfter = Date.now() + 3_000;
+      this.denySshApprovals();
+    });
+  }
+
+  private denySshApprovals() {
+    this.remoteSshApproval.cancel();
+    for (const approval of this.pendingSshApprovals.values()) {
+      approval.finish(false);
+    }
+  }
+
+  private isSshApprovalCurrent(request: SshApprovalPrompt): boolean {
+    return (
+      !this.sshApprovalsSuspended &&
+      Date.now() >= this.sshApprovalsResumeAfter &&
+      (request.requestedAt == null || request.requestedAt >= this.sshApprovalsResumeAfter) &&
+      (request.expiresAt == null || request.expiresAt > Date.now())
+    );
+  }
 
   init(show: boolean = true): Promise<any> {
     // Perform a hard reload of the render process by crashing it. This is suboptimal but ensures that all memory gets
     // cleared, as the process itself will be completely garbage collected.
     ipcMain.on("reload-process", async () => {
+      this.denySshApprovals();
+      if (isDev()) {
+        this.logService.info("Process reload requested, but skipping in development mode");
+        return;
+      }
+
       // LockService can fire reload-process concurrently for each user account.
       // Skip duplicates so we don't race the crash + reload sequence with itself.
       if (this.isReloading) {
@@ -202,6 +258,38 @@ export class WindowMain {
       });
     });
 
+    ipcMain.handle(
+      "window-show-ssh-approval",
+      (event, request: SshApprovalPrompt, barkUrl: string, waitForMac: boolean) =>
+        event.sender.id === this.win?.webContents.id
+          ? this.showSshApprovalWindow(request, barkUrl, waitForMac === true)
+          : false,
+    );
+    ipcMain.handle("window-cancel-ssh-approvals", (event) => {
+      if (event.sender.id === this.win?.webContents.id) {
+        this.denySshApprovals();
+      }
+    });
+    ipcMain.handle("window-test-ssh-bark", async (event, barkUrl: string) => {
+      if (event.sender.id !== this.win?.webContents.id) {
+        return false;
+      }
+      try {
+        await this.remoteSshApproval.test(barkUrl);
+        return true;
+      } catch {
+        // Do not log a network exception that could contain the Bark device key or link token.
+        this.logService.warning("Bark connection test failed");
+        return false;
+      }
+    });
+    ipcMain.handle("window-get-ssh-approval-request", (event) => {
+      return this.pendingSshApprovals.get(event.sender.id)?.request ?? null;
+    });
+    ipcMain.handle("window-answer-ssh-approval", (event, approved: boolean) => {
+      this.pendingSshApprovals.get(event.sender.id)?.finish(approved === true);
+    });
+
     this.desktopSettingsService.modalMode$
       .pipe(
         pairwise(),
@@ -263,6 +351,8 @@ export class WindowMain {
         app.on("before-quit", async () => {
           // Set before awaiting. The tray's close handler reads it synchronously.
           this.isQuitting = true;
+          this.denySshApprovals();
+          void this.remoteSshApproval.close();
           // Allow biometric to auto-prompt on reload
           await this.biometricStateService.resetAllPromptCancelled();
         });
@@ -339,6 +429,152 @@ export class WindowMain {
         // throw e;
         reject(e);
       }
+    });
+  }
+
+  /** Presents SSH authorization in its own panel without showing or moving the vault window. */
+  private showSshApprovalWindow(
+    request: SshApprovalPrompt,
+    barkUrl: string = "",
+    waitForMac: boolean = false,
+  ): Promise<boolean> {
+    if (!this.isSshApprovalCurrent(request)) {
+      return Promise.resolve(false);
+    }
+    // This is a final main-process guard in addition to the SSH-agent single-flight gate. Never
+    // allow duplicate renderer subscriptions or IPC callers to stack native approval panels.
+    if (this.pendingSshApprovals.size > 0) {
+      this.logService.debug("Rejecting SSH approval because a panel is already open");
+      return Promise.resolve(false);
+    }
+
+    const height = request.warningMessage == null ? 230 : 300;
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const x = Math.round(
+      display.workArea.x + (display.workArea.width - sshApprovalWindowWidth) / 2,
+    );
+    const y = Math.round(display.workArea.y + (display.workArea.height - height) / 2);
+    const approvalWindow = new BrowserWindow({
+      width: sshApprovalWindowWidth,
+      height,
+      x,
+      y,
+      title: request.title,
+      show: false,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      alwaysOnTop: true,
+      type: isMac() ? "panel" : undefined,
+      titleBarStyle: isMac() ? "hiddenInset" : undefined,
+      transparent: isMac(),
+      backgroundColor: isMac()
+        ? "#00000000"
+        : nativeTheme.shouldUseDarkColors
+          ? "#1f2937"
+          : "#ffffff",
+      webPreferences: {
+        preload: path.join(__dirname, "preload.js"),
+        spellcheck: false,
+        nodeIntegration: false,
+        contextIsolation: true,
+        session: this.session,
+        devTools: false,
+      },
+    });
+
+    approvalWindow.setContentProtection(true);
+    if (isMac()) {
+      approvalWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      approvalWindow.setAlwaysOnTop(true, "floating");
+    }
+
+    return new Promise<boolean>((resolve) => {
+      // Electron destroys webContents before BrowserWindow emits "closed". Keep the id while the
+      // window is alive so the close handler never dereferences an already-destroyed native object.
+      const webContentsId = approvalWindow.webContents.id;
+      let answered = false;
+      let cancelRemote: (() => void) | undefined;
+      let barkTimer: NodeJS.Timeout | undefined;
+      let expirationTimer: NodeJS.Timeout | undefined;
+      const finish = (approved: boolean, closeWindow: boolean = true) => {
+        if (answered) {
+          return;
+        }
+        answered = true;
+        cancelRemote?.();
+        if (barkTimer != null) {
+          global.clearTimeout(barkTimer);
+        }
+        if (expirationTimer != null) {
+          global.clearTimeout(expirationTimer);
+        }
+        this.pendingSshApprovals.delete(webContentsId);
+        resolve(approved && this.isSshApprovalCurrent(request));
+        if (closeWindow && !approvalWindow.isDestroyed()) {
+          approvalWindow.destroy();
+        }
+      };
+
+      this.pendingSshApprovals.set(webContentsId, {
+        request,
+        window: approvalWindow,
+        finish,
+      });
+      if (barkUrl) {
+        const notify = () => {
+          if (answered || !this.isSshApprovalCurrent(request)) {
+            return;
+          }
+          void this.remoteSshApproval
+            .notify(barkUrl, request, finish, () => !answered && this.isSshApprovalCurrent(request))
+            .then((cancel) => {
+              cancelRemote = cancel;
+              if (answered) {
+                cancel();
+              }
+            })
+            .catch(() => {
+              this.logService.warning(
+                "Bark SSH notification failed; desktop approval remains available",
+              );
+            });
+        };
+        if (waitForMac) {
+          barkTimer = global.setTimeout(notify, 10_000);
+        } else {
+          notify();
+        }
+      }
+      if (request.expiresAt != null) {
+        expirationTimer = global.setTimeout(
+          () => finish(false),
+          Math.max(0, request.expiresAt - Date.now()),
+        );
+      }
+      approvalWindow.on("closed", () => finish(false, false));
+      approvalWindow.once("ready-to-show", () => {
+        // Timers can run later than ready-to-show after wake. Check wall-clock validity here
+        // as well, and never touch a panel already destroyed by sleep or expiry cleanup.
+        if (answered || approvalWindow.isDestroyed()) {
+          return;
+        }
+        if (!this.isSshApprovalCurrent(request)) {
+          finish(false);
+          return;
+        }
+        applySshApprovalGlass(approvalWindow, this.logService);
+        approvalWindow.show();
+        approvalWindow.focus();
+      });
+      void approvalWindow
+        .loadURL(`${customFileScheme}://${customFileHost}/ssh-approval.html`)
+        .catch((error) => {
+          this.logService.error("Failed to load the SSH approval window", error);
+          finish(false);
+        });
     });
   }
 
@@ -506,6 +742,7 @@ export class WindowMain {
     win.webContents.on("dom-ready", () => {
       win.webContents.zoomFactor = this.windowStates[mainWindowSizeKey].zoomFactor ?? 1.0;
     });
+    this.win.webContents.on("render-process-gone", () => this.denySshApprovals());
 
     // Persist zoom changes from mouse wheel and programmatic zoom operations
     // NOTE: This event does NOT fire for keyboard shortcuts (Ctrl+/-/0, Cmd+/-/0)

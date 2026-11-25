@@ -153,6 +153,13 @@ module.exports.buildConfig = function buildConfig(params) {
     },
     plugins: [
       coreJsNoOpPlugin,
+      {
+        apply(compiler) {
+          compiler.hooks.beforeCompile.tap("SshApprovalGlass", () => {
+            require("./scripts/build-ssh-glass")(params.outputPath);
+          });
+        },
+      },
       new CopyWebpackPlugin({
         patterns: [
           path.resolve(__dirname, "src/package.json"),
@@ -196,6 +203,14 @@ module.exports.buildConfig = function buildConfig(params) {
             to: "images/premium",
           },
           { from: path.resolve(__dirname, "src/locales"), to: "locales" },
+          {
+            from: path.resolve(__dirname, "src/autofill/ssh-approval.html"),
+            to: "ssh-approval.html",
+          },
+          {
+            from: path.resolve(__dirname, "src/autofill/ssh-approval.js"),
+            to: "ssh-approval.js",
+          },
         ],
       }),
       new DefinePlugin({

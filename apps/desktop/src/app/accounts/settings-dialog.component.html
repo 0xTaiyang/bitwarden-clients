@@ -240,6 +240,45 @@
             />
             <bit-hint>{{ "sshAgentPromptBehaviorDesc" | i18n }}</bit-hint>
           </bit-form-field>
+          <bit-form-field>
+            <bit-label>{{ "sshAgentBarkUrl" | i18n }}</bit-label>
+            <input
+              bitInput
+              type="password"
+              formControlName="sshAgentBarkUrl"
+              placeholder="https://api.day.app/your-device-key"
+              autocomplete="off"
+              [spellcheck]="false"
+            />
+            <bit-hint>
+              @if (form.controls.sshAgentBarkUrl.invalid) {
+                {{ "sshAgentBarkUrlInvalid" | i18n }}
+              } @else {
+                {{ "sshAgentBarkUrlDesc" | i18n }}
+              }
+            </bit-hint>
+          </bit-form-field>
+          <bit-form-control>
+            <input type="checkbox" bitCheckbox formControlName="sshAgentBarkWaitForMac" />
+            <bit-label>{{ "sshAgentBarkWaitForMac" | i18n }}</bit-label>
+            <bit-hint>{{ "sshAgentBarkWaitForMacDesc" | i18n }}</bit-hint>
+          </bit-form-control>
+          <button
+            type="button"
+            bitButton
+            buttonType="secondary"
+            [disabled]="
+              testingBark ||
+              form.controls.sshAgentBarkUrl.invalid ||
+              !form.controls.sshAgentBarkUrl.value
+            "
+            (click)="testBarkNotification()"
+          >
+            {{ "sshAgentBarkTest" | i18n }}
+          </button>
+          @if (barkTestResult) {
+            <p aria-live="polite">{{ barkTestResult }}</p>
+          }
         }
 
         @if (!isLinux) {

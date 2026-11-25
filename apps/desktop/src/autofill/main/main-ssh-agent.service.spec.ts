@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unsafe-function-type */
 
-import { ipcMain } from "electron";
+import { ipcMain, powerMonitor } from "electron";
 
 import { MessagingService } from "@bitwarden/common/platform/abstractions/messaging.service";
 import { sshagent } from "@bitwarden/desktop-napi";
@@ -9,6 +9,7 @@ import { LogService } from "@bitwarden/logging";
 import { MainSshAgentService } from "./main-ssh-agent.service";
 
 jest.mock("electron", () => ({
+  powerMonitor: { on: jest.fn() },
   ipcMain: {
     handle: jest.fn(),
   },
@@ -27,6 +28,7 @@ describe("MainSshAgentService", () => {
   let mockMessagingService: jest.Mocked<MessagingService>;
 
   let ipcHandlers: Map<string, Function>;
+  let powerHandlers: Map<string, () => void>;
   let mockAgentState: {
     isRunning: jest.Mock;
     replace: jest.Mock;
@@ -38,6 +40,10 @@ describe("MainSshAgentService", () => {
 
   beforeEach(async () => {
     ipcHandlers = new Map();
+    powerHandlers = new Map();
+    (powerMonitor.on as jest.Mock).mockImplementation((event, handler) => {
+      powerHandlers.set(event, handler);
+    });
 
     mockLogService = {
       info: jest.fn(),
@@ -151,6 +157,8 @@ describe("MainSshAgentService", () => {
       expect(mockMessagingService.send).toHaveBeenCalledWith("sshagent.signrequest", {
         cipherId: "cipher-abc",
         requestId: 1,
+        expiresAt: expect.any(Number),
+        requestedAt: expect.any(Number),
         processName: "ssh",
         isAgentForwarding: false,
         namespace: "ssh",
@@ -174,6 +182,66 @@ describe("MainSshAgentService", () => {
       await responseHandler({}, { requestId: 1, accepted: false });
 
       expect(await signPromise).toBe(false);
+    });
+
+    it("should reject concurrent sign requests without creating an approval backlog", async () => {
+      const firstSignPromise = capturedSignCb(null, mockSignData);
+      const secondSignPromise = capturedSignCb(null, mockSignData);
+
+      await expect(secondSignPromise).resolves.toBe(false);
+      expect(mockMessagingService.send).toHaveBeenCalledTimes(1);
+      expect(mockLogService.debug).toHaveBeenCalledWith(
+        "Rejecting concurrent SSH sign request while approval is pending",
+      );
+
+      const responseHandler = ipcHandlers.get("sshagent.signrequestresponse")!;
+      await responseHandler({}, { requestId: 1, accepted: true });
+      await expect(firstSignPromise).resolves.toBe(true);
+
+      const thirdSignPromise = capturedSignCb(null, mockSignData);
+      expect(mockMessagingService.send).toHaveBeenCalledTimes(2);
+      await responseHandler({}, { requestId: 2, accepted: false });
+      await expect(thirdSignPromise).resolves.toBe(false);
+    });
+
+    it("should expire a request before the native approval timeout", async () => {
+      jest.useFakeTimers();
+      try {
+        const signPromise = capturedSignCb(null, mockSignData);
+
+        jest.advanceTimersByTime(59_000);
+
+        await expect(signPromise).resolves.toBe(false);
+        expect((mockMessagingService.send as jest.Mock).mock.calls[0][1].expiresAt).toBeGreaterThan(
+          Date.now() - 1,
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("denies pending work at sleep and drains wake callbacks before accepting new work", async () => {
+      jest.useFakeTimers();
+      try {
+        const pending = capturedSignCb(null, mockSignData);
+        powerHandlers.get("suspend")!();
+        await expect(pending).resolves.toBe(false);
+        await expect(capturedSignCb(null, mockSignData)).resolves.toBe(false);
+        await expect(capturedListCb(null)).resolves.toBe(false);
+        powerHandlers.get("resume")!();
+        await expect(capturedSignCb(null, mockSignData)).resolves.toBe(false);
+        expect(mockMessagingService.send).toHaveBeenCalledTimes(1);
+        jest.advanceTimersByTime(3_000);
+        const fresh = capturedSignCb(null, mockSignData);
+        expect(mockMessagingService.send).toHaveBeenCalledTimes(2);
+        await ipcHandlers.get("sshagent.signrequestresponse")!(
+          {},
+          { requestId: 2, accepted: true },
+        );
+        await expect(fresh).resolves.toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

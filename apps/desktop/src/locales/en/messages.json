@@ -759,6 +759,30 @@
   "sshAgentPromptBehaviorDesc": {
     "message": "Choose how to handle SSH-agent authorization requests."
   },
+  "sshAgentBarkUrl": {
+    "message": "Bark notification URL"
+  },
+  "sshAgentBarkUrlDesc": {
+    "message": "Saved on this Mac when you leave the field; clear to disable Bark. Approval links use http://taiyang-air.sgponte:52763 through Surge Ponte and expire with the SSH request (up to 59 seconds). Your vault must be unlocked."
+  },
+  "sshAgentBarkTest": {
+    "message": "Send Bark connection test"
+  },
+  "sshAgentBarkWaitForMac": {
+    "message": "Wait 10 seconds before notifying iPhone"
+  },
+  "sshAgentBarkWaitForMacDesc": {
+    "message": "Send Bark only if the Mac approval is still waiting after 10 seconds. Approving or denying on the Mac cancels the notification. The original request expiry still applies. Turn off to notify immediately."
+  },
+  "sshAgentBarkTestSent": {
+    "message": "Notification sent. Open it on your iPhone with Surge Ponte connected to check access to this Mac."
+  },
+  "sshAgentBarkTestFailed": {
+    "message": "Could not send the notification. Check the Bark URL, network connection, and availability of port 52763."
+  },
+  "sshAgentBarkUrlInvalid": {
+    "message": "Enter an HTTPS Bark URL containing your device key, without spaces, a fragment, or embedded login credentials."
+  },
   "sshAgentPromptBehaviorHelp": {
     "message": "Remember SSH authorizations"
   },

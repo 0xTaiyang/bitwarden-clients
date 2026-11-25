@@ -5,6 +5,7 @@ import { ThemeType, LogLevelType } from "@bitwarden/common/platform/enums";
 import { ForwardedIpcMessage, IpcMessage } from "@bitwarden/common/platform/ipc";
 import { Message as PlatformMessage } from "@bitwarden/common/platform/messaging";
 
+import { SshApprovalPrompt } from "../autofill/models/ssh-approval-prompt";
 import {
   allowBrowserintegrationOverride,
   isAppImage,
@@ -137,6 +138,19 @@ export default {
     });
   },
   focusWindow: () => ipcRenderer.send("window-focus"),
+  showSshApprovalWindow: (
+    request: SshApprovalPrompt,
+    barkUrl: string = "",
+    waitForMac: boolean = true,
+  ): Promise<boolean> =>
+    ipcRenderer.invoke("window-show-ssh-approval", request, barkUrl, waitForMac),
+  cancelSshApprovalWindows: (): Promise<void> => ipcRenderer.invoke("window-cancel-ssh-approvals"),
+  testSshBarkNotification: (barkUrl: string): Promise<boolean> =>
+    ipcRenderer.invoke("window-test-ssh-bark", barkUrl),
+  getSshApprovalWindowRequest: (): Promise<SshApprovalPrompt | null> =>
+    ipcRenderer.invoke("window-get-ssh-approval-request"),
+  answerSshApprovalWindow: (approved: boolean): Promise<void> =>
+    ipcRenderer.invoke("window-answer-ssh-approval", approved),
   hideWindow: () => ipcRenderer.send("window-hide"),
   log: (level: LogLevelType, message?: any, ...optionalParams: any[]) =>
     ipcRenderer.invoke("ipc.log", { level, message, optionalParams }),

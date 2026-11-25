@@ -11,9 +11,14 @@ import { LogService } from "@bitwarden/common/platform/abstractions/log.service"
 import { AbstractStorageService } from "@bitwarden/common/platform/abstractions/storage.service";
 import { BiometricStateService } from "@bitwarden/key-management";
 
+import { applySshApprovalGlass } from "../autofill/main/ssh-approval-glass";
 import { SafeShell } from "../platform/main/safe-shell.main";
 import { ModalModeState } from "../platform/models/domain/window-state";
 import { DesktopSettingsService } from "../platform/services/desktop-settings.service";
+
+jest.mock("../autofill/main/ssh-approval-glass", () => ({
+  applySshApprovalGlass: jest.fn(),
+}));
 
 // window.main.ts registers a privileged scheme at module load time, which
 // requires the electron runtime. Mock the surface the module touches on
@@ -21,9 +26,15 @@ import { DesktopSettingsService } from "../platform/services/desktop-settings.se
 jest.mock("electron", () => ({
   app: {},
   BrowserWindow: jest.fn(),
-  ipcMain: { on: jest.fn() },
+  ipcMain: { on: jest.fn(), handle: jest.fn() },
   nativeTheme: {},
-  screen: {},
+  powerMonitor: { on: jest.fn() },
+  screen: {
+    getCursorScreenPoint: jest.fn().mockReturnValue({ x: 400, y: 300 }),
+    getDisplayNearestPoint: jest.fn().mockReturnValue({
+      workArea: { x: 0, y: 0, width: 1440, height: 900 },
+    }),
+  },
   session: {},
   protocol: { registerSchemesAsPrivileged: jest.fn() },
   net: {},
@@ -110,6 +121,301 @@ describe("WindowMain", () => {
 
     it("returns false for an unparseable string without throwing", () => {
       expect(isLocalBundleUrl("not a url")).toBe(false);
+    });
+  });
+
+  describe("SSH approval window", () => {
+    const originalPlatform = process.platform;
+    let sut: WindowMain;
+    let approvalWindow: Record<string, any>;
+    let powerHandlers: Map<string, () => void>;
+    let closedHandler: () => void = () => {};
+
+    beforeEach(() => {
+      powerHandlers = new Map();
+      jest.requireMock("electron").powerMonitor.on.mockImplementation((event, handler) => {
+        powerHandlers.set(event, handler);
+      });
+      Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+      sut = new WindowMain(
+        mock<BiometricStateService>(),
+        mock<LogService>(),
+        mock<AbstractStorageService>(),
+        mock<DesktopSettingsService>(),
+        mock<SafeShell>(),
+        null,
+        () => {},
+        null,
+      );
+      approvalWindow = {
+        isDestroyed: jest.fn().mockReturnValue(false),
+        webContents: { id: 42 },
+        setVisibleOnAllWorkspaces: jest.fn(),
+        setAlwaysOnTop: jest.fn(),
+        setContentProtection: jest.fn(),
+        loadURL: jest.fn().mockResolvedValue(undefined),
+        show: jest.fn(),
+        focus: jest.fn(),
+        destroy: jest.fn(),
+        once: jest.fn((_event: string, handler: () => void) => handler()),
+        on: jest.fn((event: string, handler: () => void) => {
+          if (event === "closed") {
+            closedHandler = handler;
+          }
+        }),
+      };
+      (jest.requireMock("electron").BrowserWindow as jest.Mock).mockReturnValue(approvalWindow);
+      (sut as any).session = {};
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", {
+        value: originalPlatform,
+        configurable: true,
+      });
+    });
+
+    it("creates a separate panel on the current full-screen Space", async () => {
+      const result = (sut as any).showSshApprovalWindow({
+        title: "Confirm SSH key usage",
+        message: "Terminal is requesting access to Work key.",
+        authorizeLabel: "Authorize",
+        denyLabel: "Deny",
+      });
+
+      expect(jest.requireMock("electron").BrowserWindow).toHaveBeenCalledWith(
+        expect.objectContaining({
+          width: 440,
+          height: 230,
+          show: false,
+          type: "panel",
+          skipTaskbar: true,
+          transparent: true,
+          backgroundColor: "#00000000",
+        }),
+      );
+      expect(approvalWindow.setVisibleOnAllWorkspaces).toHaveBeenCalledWith(true, {
+        visibleOnFullScreen: true,
+      });
+      expect(approvalWindow.setAlwaysOnTop).toHaveBeenLastCalledWith(true, "floating");
+      expect(approvalWindow.loadURL).toHaveBeenCalledWith(
+        "bw-desktop-file://bundle/ssh-approval.html",
+      );
+      expect(approvalWindow.show).toHaveBeenCalled();
+      expect(jest.mocked(applySshApprovalGlass).mock.calls.at(-1)?.[0]).toBe(approvalWindow);
+      expect(approvalWindow.focus).toHaveBeenCalled();
+
+      closedHandler();
+      await expect(result).resolves.toBe(false);
+    });
+
+    it("denies cleanly when Electron has already destroyed webContents before closed", async () => {
+      const result = (sut as any).showSshApprovalWindow({
+        title: "Confirm SSH key usage",
+        message: "Terminal is requesting access to Work key.",
+        authorizeLabel: "Authorize",
+        denyLabel: "Deny",
+      });
+
+      Object.defineProperty(approvalWindow, "webContents", {
+        get: () => {
+          throw new TypeError("Object has been destroyed");
+        },
+      });
+      approvalWindow.isDestroyed.mockReturnValue(true);
+
+      expect(() => closedHandler()).not.toThrow();
+      await expect(result).resolves.toBe(false);
+      expect(approvalWindow.destroy).not.toHaveBeenCalled();
+      expect((sut as any).pendingSshApprovals.size).toBe(0);
+    });
+
+    it("routes a remote answer through the desktop decision and revokes the link", async () => {
+      const cancel = jest.fn();
+      const notify = jest.spyOn((sut as any).remoteSshApproval, "notify").mockResolvedValue(cancel);
+      const result = (sut as any).showSshApprovalWindow(
+        {
+          title: "Confirm SSH key usage",
+          message: "Work key.",
+          authorizeLabel: "Authorize",
+          denyLabel: "Deny",
+          expiresAt: Date.now() + 59_000,
+        },
+        "https://api.day.app/test-key",
+      );
+      await Promise.resolve();
+      const finish = notify.mock.calls[0][2] as (accepted: boolean) => void;
+      finish(true);
+      await expect(result).resolves.toBe(true);
+      expect(cancel).toHaveBeenCalled();
+      expect(approvalWindow.destroy).toHaveBeenCalled();
+      expect((sut as any).pendingSshApprovals.size).toBe(0);
+    });
+
+    it("waits 10 seconds before Bark and preserves the original expiry", async () => {
+      jest.useFakeTimers();
+      try {
+        const notify = jest
+          .spyOn((sut as any).remoteSshApproval, "notify")
+          .mockResolvedValue(jest.fn());
+        const expiresAt = Date.now() + 59_000;
+        const prompt = {
+          title: "SSH",
+          message: "Test key",
+          authorizeLabel: "Approve",
+          denyLabel: "Deny",
+          expiresAt,
+        };
+        const result = (sut as any).showSshApprovalWindow(prompt, "https://api.day.app/test", true);
+        jest.advanceTimersByTime(9_999);
+        expect(notify).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(notify).toHaveBeenCalledTimes(1);
+        expect((notify.mock.calls[0][1] as any).expiresAt).toBe(expiresAt);
+        closedHandler();
+        await expect(result).resolves.toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it.each(["approve", "deny", "sleep", "expire"])(
+      "cancels delayed Bark when the Mac request ends: %s",
+      async (action) => {
+        jest.useFakeTimers();
+        try {
+          const notify = jest
+            .spyOn((sut as any).remoteSshApproval, "notify")
+            .mockResolvedValue(jest.fn());
+          const prompt = {
+            title: "SSH",
+            message: "Test key",
+            authorizeLabel: "Approve",
+            denyLabel: "Deny",
+            expiresAt: Date.now() + (action === "expire" ? 5_000 : 59_000),
+          };
+          const result = (sut as any).showSshApprovalWindow(
+            prompt,
+            "https://api.day.app/test",
+            true,
+          );
+          jest.advanceTimersByTime(4_000);
+          if (action === "sleep") {
+            powerHandlers.get("suspend")!();
+          } else if (action !== "expire") {
+            (sut as any).pendingSshApprovals.get(42).finish(action === "approve");
+          }
+          jest.advanceTimersByTime(10_000);
+          expect(notify).not.toHaveBeenCalled();
+          await expect(result).resolves.toBe(action === "approve");
+        } finally {
+          jest.useRealTimers();
+        }
+      },
+    );
+
+    it("rejects a second approval instead of stacking another panel", async () => {
+      const browserWindowMock = jest.requireMock("electron").BrowserWindow as jest.Mock;
+      const initialWindowCount = browserWindowMock.mock.calls.length;
+      const firstResult = (sut as any).showSshApprovalWindow({
+        title: "Confirm SSH key usage",
+        message: "Terminal is requesting access to Work key.",
+        authorizeLabel: "Authorize",
+        denyLabel: "Deny",
+      });
+
+      const secondResult = (sut as any).showSshApprovalWindow({
+        title: "Confirm SSH key usage",
+        message: "Terminal is requesting access to Work key.",
+        authorizeLabel: "Authorize",
+        denyLabel: "Deny",
+      });
+
+      await expect(secondResult).resolves.toBe(false);
+      expect(browserWindowMock).toHaveBeenCalledTimes(initialWindowCount + 1);
+
+      closedHandler();
+      await expect(firstResult).resolves.toBe(false);
+    });
+
+    it("closes an approval panel when its SSH request expires", async () => {
+      jest.useFakeTimers();
+      try {
+        const result = (sut as any).showSshApprovalWindow({
+          title: "Confirm SSH key usage",
+          message: "Terminal is requesting access to Work key.",
+          authorizeLabel: "Authorize",
+          denyLabel: "Deny",
+          expiresAt: Date.now() + 1_000,
+        });
+
+        jest.advanceTimersByTime(1_000);
+
+        await expect(result).resolves.toBe(false);
+        expect(approvalWindow.destroy).toHaveBeenCalledTimes(1);
+        expect((sut as any).pendingSshApprovals.size).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("discards an expired panel before ready-to-show even if its timer has not fired", async () => {
+      jest.useFakeTimers();
+      try {
+        let ready: () => void;
+        approvalWindow.once.mockImplementation((_event, handler) => {
+          ready = handler;
+        });
+        const result = (sut as any).showSshApprovalWindow({
+          title: "SSH",
+          message: "Request",
+          authorizeLabel: "Authorize",
+          denyLabel: "Deny",
+          expiresAt: Date.now() + 1_000,
+        });
+        jest.setSystemTime(Date.now() + 2_000);
+        ready!();
+        await expect(result).resolves.toBe(false);
+        expect(approvalWindow.show).not.toHaveBeenCalled();
+        expect(approvalWindow.destroy).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("destroys a sleeping panel and refuses queued approvals after wake", async () => {
+      jest.useFakeTimers();
+      try {
+        let ready: () => void;
+        approvalWindow.once.mockImplementation((_event, handler) => {
+          ready = handler;
+        });
+        const prompt = {
+          title: "SSH",
+          message: "Request",
+          authorizeLabel: "Authorize",
+          denyLabel: "Deny",
+          requestedAt: Date.now(),
+          expiresAt: Date.now() + 59_000,
+        };
+        const result = (sut as any).showSshApprovalWindow(prompt);
+        powerHandlers.get("suspend")!();
+        await expect(result).resolves.toBe(false);
+        ready!();
+        expect(approvalWindow.show).not.toHaveBeenCalled();
+        expect(approvalWindow.destroy).toHaveBeenCalledTimes(1);
+        powerHandlers.get("resume")!();
+        await expect((sut as any).showSshApprovalWindow(prompt)).resolves.toBe(false);
+        jest.advanceTimersByTime(3_000);
+        await expect((sut as any).showSshApprovalWindow(prompt)).resolves.toBe(false);
+        const fresh = (sut as any).showSshApprovalWindow({ ...prompt, requestedAt: Date.now() });
+        ready!();
+        expect(approvalWindow.show).toHaveBeenCalledTimes(1);
+        closedHandler();
+        await expect(fresh).resolves.toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

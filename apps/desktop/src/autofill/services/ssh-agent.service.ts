@@ -36,9 +36,10 @@ import { CipherView } from "@bitwarden/common/vault/models/view/cipher.view";
 import { DialogService, ToastService } from "@bitwarden/components";
 
 import { DesktopSettingsService } from "../../platform/services/desktop-settings.service";
-import { ApproveSshRequestComponent } from "../components/approve-ssh-request";
 import { SSH_AGENT_IPC_CHANNELS } from "../models/ipc-channels";
 import { SshAgentPromptType } from "../models/ssh-agent-setting";
+
+import { DesktopAutofillSettingsService } from "./desktop-autofill-settings.service";
 
 /**
  * Namespacing for cached sign authorizations.
@@ -57,19 +58,21 @@ export class SshAgentService implements OnDestroy {
 
   // map of cipherId to set of host key fingerprints who's sign requests have been authorized.
   private authorizedHosts: Map<string, Set<string>> = new Map();
+  private approvalEpoch = 0;
 
   private destroy$ = new Subject<void>();
 
   constructor(
     private cipherService: CipherService,
     private logService: LogService,
-    private dialogService: DialogService,
+    _dialogService: DialogService,
     private messageListener: MessageListener,
     private authService: AuthService,
     private toastService: ToastService,
     private i18nService: I18nService,
     private desktopSettingsService: DesktopSettingsService,
     private accountService: AccountService,
+    private desktopAutofillSettingsService: DesktopAutofillSettingsService,
   ) {}
 
   async init() {
@@ -199,6 +202,8 @@ export class SshAgentService implements OnDestroy {
         tap(() => {
           this.logService.debug("Active account changed, resetting SSH sign approval state");
           this.authorizedHosts = new Map();
+          this.approvalEpoch++;
+          void ipc.platform.cancelSshApprovalWindows?.();
         }),
         takeUntil(this.destroy$),
       )
@@ -221,6 +226,8 @@ export class SshAgentService implements OnDestroy {
       )
       .subscribe(() => {
         this.authorizedHosts = new Map();
+        this.approvalEpoch++;
+        void ipc.platform.cancelSshApprovalWindows?.();
       });
 
     // Handle list-keys requests when the vault is locked (BFU case).
@@ -366,6 +373,8 @@ export class SshAgentService implements OnDestroy {
   }
 
   ngOnDestroy() {
+    this.approvalEpoch++;
+    void ipc.platform.cancelSshApprovalWindows?.();
     this.destroy$.next();
     this.destroy$.complete();
   }
@@ -383,6 +392,8 @@ export class SshAgentService implements OnDestroy {
 
   // Stops the agent server if it is running.
   private async stopAgent(): Promise<void> {
+    this.approvalEpoch++;
+    void ipc.platform.cancelSshApprovalWindows?.();
     try {
       if (await ipc.autofill.sshAgent.isLoaded()) {
         await ipc.autofill.sshAgent.stop();
@@ -404,10 +415,18 @@ export class SshAgentService implements OnDestroy {
   private async processSignRequest(message: Record<string, unknown>, ciphers: CipherView[]) {
     const cipherId = message.cipherId as string;
     const requestId = message.requestId as number;
+    const expiresAt = message.expiresAt as number | undefined;
     let application = message.processName as string;
     const namespace = message.namespace as string;
     const isAgentForwarding = message.isAgentForwarding as boolean;
     const hostFingerprint = message.hostFingerprint as string | undefined;
+
+    // A native approval callback expires after 60 seconds. Requests can accumulate while macOS is
+    // asleep, so never display one whose SSH client is no longer waiting for the answer.
+    if (expiresAt != null && expiresAt <= Date.now()) {
+      this.logService.debug("Ignoring expired SSH sign approval request");
+      return ipc.autofill.sshAgent.signRequestResponse(requestId, false);
+    }
 
     if (application == "") {
       application = this.i18nService.t("unknownApplication");
@@ -425,16 +444,43 @@ export class SshAgentService implements OnDestroy {
     }
 
     if (await this.needsAuthorization(cipherId, isAgentForwarding, hostFingerprint)) {
-      ipc.platform.focusWindow();
-      const dialogRef = ApproveSshRequestComponent.open(
-        this.dialogService,
-        cipher.name,
-        application,
-        isAgentForwarding,
-        namespace,
+      const approvalEpoch = this.approvalEpoch;
+      let actioni18nKey = "sshActionLogin";
+      if (namespace === "git") {
+        actioni18nKey = "sshActionGitSign";
+      } else if (namespace != null && namespace !== "") {
+        actioni18nKey = "sshActionSign";
+      }
+
+      const barkUrl = await firstValueFrom(this.desktopAutofillSettingsService.sshAgentBarkUrl$);
+      const waitForMac = await firstValueFrom(
+        this.desktopAutofillSettingsService.sshAgentBarkWaitForMac$,
+      );
+      const approved = await ipc.platform.showSshApprovalWindow(
+        {
+          title: this.i18nService.t("sshkeyApprovalTitle"),
+          message: `${application} ${this.i18nService.t("sshkeyApprovalMessageInfix")} ${cipher.name} ${this.i18nService.t("sshkeyApprovalMessageSuffix")} ${this.i18nService.t(actioni18nKey)}.`,
+          warningTitle: isAgentForwarding
+            ? this.i18nService.t("agentForwardingWarningTitle")
+            : undefined,
+          warningMessage: isAgentForwarding
+            ? this.i18nService.t("agentForwardingWarningText")
+            : undefined,
+          authorizeLabel: this.i18nService.t("authorize"),
+          denyLabel: this.i18nService.t("deny"),
+          expiresAt,
+          requestedAt: message.requestedAt as number | undefined,
+          hostFingerprint,
+        },
+        barkUrl,
+        waitForMac,
       );
 
-      if (await firstValueFrom(dialogRef.closed)) {
+      if (
+        approved &&
+        approvalEpoch === this.approvalEpoch &&
+        (expiresAt == null || expiresAt > Date.now())
+      ) {
         await this.storeAuthorizedHost(cipherId, isAgentForwarding, hostFingerprint);
         return ipc.autofill.sshAgent.signRequestResponse(requestId, true);
       } else {
