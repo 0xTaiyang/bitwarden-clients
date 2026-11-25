@@ -30,6 +30,7 @@ npm-debug.log
 dist
 build
 target
+apps/desktop/dist-*
 .angular/cache
 .flatpak
 .flatpak-repo
